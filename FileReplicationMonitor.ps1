@@ -55,8 +55,12 @@ function Cleanup-Logs {
     $cutoff = (Get-Date).AddDays(-5).Date
     Get-ChildItem -Path $global:LogDir -Filter "app-*.log" | ForEach-Object {
         if ($_.Name -match "app-(\d{4})(\d{2})(\d{2})\.log") {
-            $logDate = [datetime]::new([int]$matches[1], [int]$matches[2], [int]$matches[3])
-            if ($logDate -lt $cutoff) { Remove-Item $_.FullName -Force }
+            try {
+                $logDate = [datetime]::new([int]$matches[1], [int]$matches[2], [int]$matches[3])
+                if ($logDate -lt $cutoff) { Remove-Item $_.FullName -Force }
+            } catch {
+                # Skip invalid date formats
+            }
         }
     }
 }
@@ -137,6 +141,9 @@ foreach ($srv in $Config.WebServers) {
     $Grid.Columns.Add($srv, $srv) | Out-Null
 }
 
+# Store explicit reference to avoid fragile control indexing
+$global:GridControl = $Grid
+
 $BottomPanel = New-Object System.Windows.Forms.Panel
 $BottomPanel.Dock = "Bottom"
 $BottomPanel.Height = 150
@@ -187,7 +194,7 @@ function Update-CellStatus {
 
 # --- 7. Polling Logic (Runspace) ---
 $PollingScript = {
-    param($Form, $RowIndex, $ServerName, $Url, $Config, $SharedState, $StartTicks)
+    param($GridControl, $RowIndex, $ServerName, $Url, $Config, $SharedState, $StartTicks)
     
     $timeoutSeconds = $Config.TimeoutSeconds
     $intervalMs = $Config.PollIntervalMs
@@ -196,18 +203,21 @@ $PollingScript = {
     
     $success = $false
     $lastError = $null
+    $timedOut = $false
 
     while ($SharedState.IsRunning -and $stopwatch.Elapsed.TotalSeconds -le $timeoutSeconds) {
         $elapsedSec = [math]::Floor($stopwatch.Elapsed.TotalSeconds)
         
         # Update UI: Scanning
         $scanMsg = "Scanning... ({0}s)" -f $elapsedSec
-        $Form.Invoke([action]{
-            if ($RowIndex -lt $Form.Controls[0].Rows.Count) { # Form.Controls[0] is Grid
-                $Form.Controls[0].Rows[$RowIndex].Cells[$ServerName].Value = $scanMsg
+        $GridControl.Invoke([action]{
+            if ($RowIndex -lt $GridControl.Rows.Count) {
+                $GridControl.Rows[$RowIndex].Cells[$ServerName].Value = $scanMsg
             }
         })
 
+        $req = $null
+        $resp = $null
         try {
             $req = [System.Net.WebRequest]::Create($Url)
             $req.Method = $method
@@ -216,7 +226,6 @@ $PollingScript = {
 
             $resp = $req.GetResponse()
             $statusCode = [int]$resp.StatusCode
-            $resp.Close()
 
             if ($statusCode -eq 200) {
                 $success = $true
@@ -224,8 +233,14 @@ $PollingScript = {
             }
         } catch {
             $lastError = $_.Exception.Message
-            if ($_.Exception.Response) {
-                $_.Exception.Response.Close()
+        } finally {
+            # Ensure cleanup of response object
+            if ($resp) {
+                try { $resp.Close() } catch {}
+                try { $resp.Dispose() } catch {}
+            }
+            if ($req) {
+                try { $req.Abort() } catch {}
             }
         }
 
@@ -234,17 +249,22 @@ $PollingScript = {
 
     if (-not $SharedState.IsRunning) { return } # Aborted
 
+    # Check if timeout occurred
+    if ($stopwatch.Elapsed.TotalSeconds -gt $timeoutSeconds -and -not $success) {
+        $timedOut = $true
+    }
+
     $finalSec = [math]::Floor($stopwatch.Elapsed.TotalSeconds)
     if ($success) {
         $finalMsg = "OK ({0}s)" -f $finalSec
-        $Form.Invoke([action]{ $Form.Controls[0].Rows[$RowIndex].Cells[$ServerName].Value = $finalMsg })
+        $GridControl.Invoke([action]{ $GridControl.Rows[$RowIndex].Cells[$ServerName].Value = $finalMsg })
     } else {
-        if ($lastError) {
-            $finalMsg = "ERROR ({0}s)" -f $finalSec
-        } else {
+        if ($timedOut) {
             $finalMsg = "TIMEOUT ({0}s)" -f $finalSec
+        } else {
+            $finalMsg = "ERROR ({0}s)" -f $finalSec
         }
-        $Form.Invoke([action]{ $Form.Controls[0].Rows[$RowIndex].Cells[$ServerName].Value = $finalMsg })
+        $GridControl.Invoke([action]{ $GridControl.Rows[$RowIndex].Cells[$ServerName].Value = $finalMsg })
     }
 }
 
@@ -254,14 +274,14 @@ function Start-Monitoring {
     if (-not $rootUnc.EndsWith("\")) { $rootUnc += "\" }
 
     # Validation
-    if (-not (Test-Path $rootUnc)) {
+    if (-not (Test-Path $rootUnc -PathType Container)) {
         [System.Windows.Forms.MessageBox]::Show("Root UNC is not reachable: $rootUnc", "Validation Error")
         return
     }
 
     foreach ($sub in $Config.Subfolders) {
         $fullPath = Join-Path $rootUnc $sub
-        if (-not (Test-Path $fullPath)) {
+        if (-not (Test-Path $fullPath -PathType Container)) {
             [System.Windows.Forms.MessageBox]::Show("Monitored subfolder missing: $fullPath", "Validation Error")
             return
         }
@@ -270,7 +290,9 @@ function Start-Monitoring {
     Write-AppLog "Starting monitoring..."
     $SharedState.IsRunning = $true
 
-    $global:RunspacePool = [runspacefactory]::CreateRunspacePool(1, [Environment]::ProcessorCount)
+    # Use fixed thread pool size (smaller than processor count to avoid excessive idle threads)
+    $poolSize = [math]::Min(4, [Environment]::ProcessorCount)
+    $global:RunspacePool = [runspacefactory]::CreateRunspacePool(1, $poolSize)
     $global:RunspacePool.ThreadOptions = "ReuseThread"
     $global:RunspacePool.Open()
 
@@ -311,12 +333,13 @@ function Create-Watcher([string]$Path) {
                     foreach ($srv in $Config.WebServers) {
                         $baseUrl = $srv
                         if ($baseUrl.EndsWith("/")) { $baseUrl = $baseUrl.Substring(0, $baseUrl.Length - 1) }
-                        $targetUrl = "$baseUrl/$relativePath"
+                        # Use System.Uri to properly construct URL without double slashes
+                        $targetUrl = ([System.Uri]"$baseUrl/").AbsoluteUri.TrimEnd('/') + "/" + $relativePath
 
                         # Dispatch Job
                         $ps = [powershell]::Create()
                         $null = $ps.AddScript($PollingScript)
-                        $null = $ps.AddArgument($Form)
+                        $null = $ps.AddArgument($global:GridControl)
                         $null = $ps.AddArgument($idx)
                         $null = $ps.AddArgument($srv)
                         $null = $ps.AddArgument($targetUrl)
@@ -325,8 +348,11 @@ function Create-Watcher([string]$Path) {
                         $null = $ps.AddArgument([datetime]::Now.Ticks)
 
                         $ps.RunspacePool = $global:RunspacePool
-                        $ActiveRunspaces.Add($ps)
-                        $null = $ps.BeginInvoke()
+                        $psHandle = @{
+                            PowerShell = $ps
+                            Handle = $ps.BeginInvoke()
+                        }
+                        $ActiveRunspaces.Add($psHandle)
                     }
                 }
             }
@@ -338,8 +364,9 @@ function Create-Watcher([string]$Path) {
             Log-ErrorUI "Watcher failed for $badPath : $($errArgs.GetException().Message)"
             Write-AppLog "Watcher error on $badPath" "ERROR"
             
-            # Attempt restart
+            # Attempt restart with small delay to avoid rapid retry loops
             try {
+                Start-Sleep -Milliseconds 500
                 Update-UI { 
                     $Watchers = $Watchers | Where-Object { $_.Path -ne $badPath } 
                     Create-Watcher $badPath
@@ -348,7 +375,7 @@ function Create-Watcher([string]$Path) {
             } catch {
                 Update-UI {
                     [System.Windows.Forms.MessageBox]::Show(
-                        "Monitoring broken for $badPath. Restart failed. Please use an older script or check network.",
+                        "Monitoring broken for $badPath. Restart failed. Please check network and restart the application.",
                         "Watcher Critical Failure",
                         [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Error
@@ -379,11 +406,22 @@ function Stop-Monitoring {
     $Watchers.Clear()
     Get-EventSubscriber | Where-Object { $_.SourceObject -is [System.IO.FileSystemWatcher] } | Unregister-Event
 
-    # Abort active runspaces
-    foreach ($ps in $ActiveRunspaces) {
-        if ($ps.RunspacePool -ne $null) {
-            try { $ps.Stop() } catch {}
-            $ps.Dispose()
+    # Properly cleanup active runspaces
+    foreach ($psHandle in $ActiveRunspaces) {
+        try {
+            $ps = $psHandle.PowerShell
+            $handle = $psHandle.Handle
+            if ($ps -and $handle) {
+                # Wait for completion with timeout
+                if (-not $handle.IsCompleted) {
+                    $ps.Stop()
+                }
+                # Properly drain the pipeline
+                try { $ps.EndInvoke($handle) | Out-Null } catch {}
+            }
+            if ($ps) { $ps.Dispose() }
+        } catch {
+            # Best effort cleanup
         }
     }
     $ActiveRunspaces.Clear()
