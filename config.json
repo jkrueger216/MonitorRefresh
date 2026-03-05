@@ -1,0 +1,20 @@
+{
+    "WebServers":  [
+                       "https://ihs-wb-p02.pktic.fiscalad.treasury.gov",
+                       "https://ihs-wb-p05.pktic.fiscalad.treasury.gov",
+                       "https://ihs-wb-p11.pktic.fiscalad.treasury.gov",
+                       "https://ihs-wb-p12.pktic.fiscalad.treasury.gov",
+                       "https://ihs-wb-p13.pktic.fiscalad.treasury.gov"
+                   ],
+    "RootUNC":  "\\\\cwi-rp-p01\\treasurydirect.gov\\htdocs\\",
+    "CertVerificationEnabled":  false,
+    "UseHeadVsGet":  "HEAD",
+    "Subfolders":  [
+                       "instit\\annceresult\\press\\preanre\\2026",
+                       "instit\\annceresult\\press\\preanre",
+                       "xml"
+                   ],
+    "TimeoutSeconds":  180,
+    "PollIntervalMs":  900,
+    "FilenameRegex":  "^(PendingAuctions\\.(pdf|xml)|A_\\d{8}_\\d\\.(xml|pdf)|SPL_\\d{8}_\\d\\.pdf|BPD_SPL_\\d{8}_\\d\\.pdf|R_\\d{8}_\\d\\.(xml|pdf)|NCR_\\d{8}_\\d\\.pdf|CPI_\\d{8}\\.(xml|pdf)|BBA_\\d{14}\\.(pdf|xml)|BBPA_\\d{14}\\.(pdf|xml)|BBR_\\d{14}\\.(pdf|xml)|BBSPL_\\d{14}\\.(pdf|xml))$"
+}
