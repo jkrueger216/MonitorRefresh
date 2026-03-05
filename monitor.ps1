@@ -91,13 +91,21 @@ $btnRmvMon_Click = {
 
 # --- Async Polling Script Block (runs in RunspacePool) ---
 $PollingScript = {
- param($GridControl, $RowIndex, $ServerName, $ColIndex, $Url, $Form1, $MonitoringActive)
+ param($GridControl, $RowIndex, $ServerName, $ColIndex, $Url, $Form1, $StopSignal)
  
- $timeout = (Get-Date).AddMinutes(3)
+ # Wait before polling - file just created, may not be replicated yet
+ Start-Sleep -Milliseconds 2000  # 2-second delay for file to be ready
+ 
  $success = $false
+ $cancelled = $false
  $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+ # Fallback: if stop signal was not passed for any reason, keep polling by timeout
+ if (-not $StopSignal) {
+  $StopSignal = New-Object System.Threading.ManualResetEventSlim($false)
+ }
  
- while ($MonitoringActive.IsRunning -and $stopwatch.Elapsed.TotalSeconds -lt 180) {
+ while (-not $StopSignal.IsSet -and $stopwatch.Elapsed.TotalSeconds -lt 180) {
   $elapsedSec = [math]::Floor($stopwatch.Elapsed.TotalSeconds)
   
   # Update UI: Scanning status with elapsed time
@@ -114,6 +122,7 @@ $PollingScript = {
    $req.Method = "HEAD"
    $req.Timeout = 5000  # 5 second request timeout
    $req.AllowAutoRedirect = $false
+   $req.UseDefaultCredentials = $true
    
    $resp = $req.GetResponse()
    $statusCode = [int]$resp.StatusCode
@@ -140,11 +149,15 @@ $PollingScript = {
  
  # Final status update
  $finalSec = [math]::Floor($stopwatch.Elapsed.TotalSeconds)
+ if (-not $success -and $StopSignal.IsSet) { $cancelled = $true }
  $Form1.Invoke([action]{
   if ($RowIndex -lt $GridControl.Rows.Count) {
    if ($success) {
     $GridControl.Rows[$RowIndex].Cells[$ColIndex].Value = "FOUND (200)"
     $GridControl.Rows[$RowIndex].Cells[$ColIndex].Style.BackColor = [System.Drawing.Color]::LightGreen
+   } elseif ($cancelled) {
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Value = "CANCELLED ($finalSec s)"
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Style.BackColor = [System.Drawing.Color]::LightYellow
    } else {
     $GridControl.Rows[$RowIndex].Cells[$ColIndex].Value = "TIMEOUT ($finalSec s)"
     $GridControl.Rows[$RowIndex].Cells[$ColIndex].Style.BackColor = [System.Drawing.Color]::LightCoral
@@ -223,7 +236,7 @@ $btnHistory_Click = {
                             
                             foreach ($srv in $webServers) {
                                 $colIndex = $grid.Columns[$srv].Index
-                                $fullUrl = "https://$srv/$subPath/$($file.Name)".Replace('\\\', '/')
+                                $fullUrl = "https://$srv/$subPath/$($file.Name)".Replace('\', '/')
                                 
                                 try {
                                     $req = [System.Net.WebRequest]::Create($fullUrl)
@@ -261,6 +274,7 @@ $btnHistory_Click = {
 
 # Global state for monitoring and runspace management
 $script:MonitoringActive = @{ IsRunning = $false }
+$script:StopSignal = $null
 $script:RunspacePool = $null
 $script:ActiveRunspaces = @()
 
@@ -281,6 +295,10 @@ $btnStart_Click = {
  
  # --- 1.5. Initialize RunspacePool for async polling ---
  $script:MonitoringActive.IsRunning = $true
+ if ($script:StopSignal) {
+  try { $script:StopSignal.Dispose() } catch {}
+ }
+ $script:StopSignal = New-Object System.Threading.ManualResetEventSlim($false)
  $poolSize = [math]::Min(8, [System.Environment]::ProcessorCount)
  $script:RunspacePool = [runspacefactory]::CreateRunspacePool(1, $poolSize)
  $script:RunspacePool.Open()
@@ -327,7 +345,7 @@ $btnStart_Click = {
     foreach ($webServer in $lstWeb.Items) {
      try {
       $colIndex = $DataGridView1.Columns[$webServer].Index
-      $fullUrl = "https://$webServer/$subPath/$fileName".Replace('\\', '/')
+      $fullUrl = "https://$webServer/$subPath/$fileName".Replace('\', '/')
       
       # Create PowerShell instance to run polling in background
       $ps = [powershell]::Create()
@@ -339,7 +357,7 @@ $btnStart_Click = {
       $null = $ps.AddArgument($colIndex)
       $null = $ps.AddArgument($fullUrl)
       $null = $ps.AddArgument($Form1)
-      $null = $ps.AddArgument($script:MonitoringActive)
+      $null = $ps.AddArgument($script:StopSignal)
       
       # Launch async (non-blocking) and store for cleanup
       $handle = $ps.BeginInvoke()
@@ -365,6 +383,9 @@ $btnStop_Click = {
  
  # --- Stop Monitoring & Clean Up Async Resources ---
  $script:MonitoringActive.IsRunning = $false
+ if ($script:StopSignal) {
+  try { $script:StopSignal.Set() } catch {}
+ }
  
  # Disable all watchers and dispose them
  foreach ($watcher in $script:activeWatchers) {
@@ -394,6 +415,11 @@ $btnStop_Click = {
   $script:RunspacePool.Close()
   $script:RunspacePool.Dispose()
   $script:RunspacePool = $null
+ }
+
+ if ($script:StopSignal) {
+  try { $script:StopSignal.Dispose() } catch {}
+  $script:StopSignal = $null
  }
 }
 
