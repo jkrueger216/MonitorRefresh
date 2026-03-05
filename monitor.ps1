@@ -166,6 +166,34 @@ $PollingScript = {
  })
 }
 
+# Shared dispatcher: queues per-server polling jobs for a single file row
+$DispatchPollingJobsForFile = {
+ param($GridControl, $RowIndex, $SubPath, $FileName, $WebServers, $Form1, $RunspacePool, $StopSignal, $RunspaceCollection)
+
+ foreach ($webServer in $WebServers) {
+  try {
+   $colIndex = $GridControl.Columns[$webServer].Index
+   $fullUrl = "https://$webServer/$SubPath/$FileName".Replace('\', '/')
+
+   $ps = [powershell]::Create()
+   $ps.RunspacePool = $RunspacePool
+   $null = $ps.AddScript($PollingScript)
+   $null = $ps.AddArgument($GridControl)
+   $null = $ps.AddArgument($RowIndex)
+   $null = $ps.AddArgument($webServer)
+   $null = $ps.AddArgument($colIndex)
+   $null = $ps.AddArgument($fullUrl)
+   $null = $ps.AddArgument($Form1)
+   $null = $ps.AddArgument($StopSignal)
+
+   $handle = $ps.BeginInvoke()
+   [void]$RunspaceCollection.Add(@{ PowerShell = $ps; Handle = $handle })
+  } catch {
+   # Silently ignore per-server dispatch errors
+  }
+ }
+}
+
 # --- History Scan Form Logic (UPDATED with Dynamic Columns, Colors, and SSL fix) ---
 
 $btnHistory_Click = {
@@ -221,47 +249,64 @@ $btnHistory_Click = {
         
         $monitorPaths = $lstMonitor.Items
         $rootPath = $txtRoot.Text
-        
-        foreach ($subPath in $monitorPaths) {
-            $fullPath = Join-Path -Path $rootPath -ChildPath $subPath
-            if (Test-Path $fullPath) {
-                $dirInfo = New-Object System.IO.DirectoryInfo($fullPath)
-                foreach ($file in $dirInfo.EnumerateFiles()) {
-                    [System.Windows.Forms.Application]::DoEvents()
-                    if ($file.LastWriteTime -ge $targetDate -and $file.LastWriteTime -lt $nextDay) {
-                        if ($file.Name -match $regexPattern) {
-                            
-                            # Add row with file info first
-                            $rowIndex = $grid.Rows.Add(@($file.Name, $subPath))
-                            
-                            foreach ($srv in $webServers) {
-                                $colIndex = $grid.Columns[$srv].Index
-                                $fullUrl = "https://$srv/$subPath/$($file.Name)".Replace('\', '/')
-                                
-                                try {
-                                    $req = [System.Net.WebRequest]::Create($fullUrl)
-                                    $req.Method = "HEAD"
-                                    $req.Timeout = 2000
-                                    $req.UseDefaultCredentials = $true
-                                    $resp = $req.GetResponse()
-                                    
-                                    # Update specific cell for this server with color
-                                    $grid.Rows[$rowIndex].Cells[$colIndex].Value = "FOUND ($($resp.StatusCode))"
-                                    $grid.Rows[$rowIndex].Cells[$colIndex].Style.BackColor = [System.Drawing.Color]::LightGreen
-                                    $resp.Close()
-                                } catch {
-                                    $msg = $_.Exception.Message
-                                    if ($msg -match "timed out") { $msg = "Timeout" }
-                                    # Update specific cell for this server with color
-                                    $grid.Rows[$rowIndex].Cells[$colIndex].Value = "MISSING ($msg)"
-                                    $grid.Rows[$rowIndex].Cells[$colIndex].Style.BackColor = [System.Drawing.Color]::LightCoral
-                                }
+
+        $historyStopSignal = New-Object System.Threading.ManualResetEventSlim($false)
+        $historyRunspacePool = [runspacefactory]::CreateRunspacePool(1, [math]::Min(8, [System.Environment]::ProcessorCount))
+        $historyRunspacePool.Open()
+        $historyRunspaces = New-Object System.Collections.ArrayList
+
+        try {
+            foreach ($subPath in $monitorPaths) {
+                $fullPath = Join-Path -Path $rootPath -ChildPath $subPath
+                if (Test-Path $fullPath) {
+                    $dirInfo = New-Object System.IO.DirectoryInfo($fullPath)
+                    foreach ($file in $dirInfo.EnumerateFiles()) {
+                        [System.Windows.Forms.Application]::DoEvents()
+                        if ($file.LastWriteTime -ge $targetDate -and $file.LastWriteTime -lt $nextDay) {
+                            if ($file.Name -match $regexPattern) {
+                                # Add row with file info, then dispatch shared polling jobs
+                                $rowIndex = $grid.Rows.Add(@($file.Name, $subPath))
+                                & $DispatchPollingJobsForFile $grid $rowIndex $subPath $file.Name $webServers $histForm $historyRunspacePool $historyStopSignal $historyRunspaces
                             }
                         }
                     }
                 }
             }
+
+            # Keep the dialog responsive while background jobs complete
+            while ($true) {
+                $pending = $false
+                foreach ($job in $historyRunspaces) {
+                    if ($job.Handle -and -not $job.Handle.IsCompleted) {
+                        $pending = $true
+                        break
+                    }
+                }
+
+                [System.Windows.Forms.Application]::DoEvents()
+                if (-not $pending) { break }
+                Start-Sleep -Milliseconds 100
+            }
+        } finally {
+            $historyStopSignal.Set()
+
+            foreach ($job in $historyRunspaces) {
+                try {
+                    if ($job.Handle) {
+                        $job.PowerShell.EndInvoke($job.Handle) | Out-Null
+                    }
+                } catch {
+                    # Ignore cleanup faults
+                } finally {
+                    try { $job.PowerShell.Dispose() } catch {}
+                }
+            }
+
+            try { $historyRunspacePool.Close() } catch {}
+            try { $historyRunspacePool.Dispose() } catch {}
+            try { $historyStopSignal.Dispose() } catch {}
         }
+
         $btnScan.Enabled = $true
         $btnScan.Text = "Scan Files"
         [System.Windows.Forms.MessageBox]::Show("Scan Complete")
@@ -276,7 +321,7 @@ $btnHistory_Click = {
 $script:MonitoringActive = @{ IsRunning = $false }
 $script:StopSignal = $null
 $script:RunspacePool = $null
-$script:ActiveRunspaces = @()
+$script:ActiveRunspaces = New-Object System.Collections.ArrayList
 
 $btnStart_Click = {
  # SAVE CHANGES (captures the current Root path)
@@ -302,7 +347,7 @@ $btnStart_Click = {
  $poolSize = [math]::Min(8, [System.Environment]::ProcessorCount)
  $script:RunspacePool = [runspacefactory]::CreateRunspacePool(1, $poolSize)
  $script:RunspacePool.Open()
- $script:ActiveRunspaces = @()
+ $script:ActiveRunspaces = New-Object System.Collections.ArrayList
  
  # --- 2. Dynamic Grid Setup (Reset Columns) ---
  $DataGridView1.Columns.Clear()
@@ -341,31 +386,8 @@ $btnStart_Click = {
     # Add grid row for this file
     $rowIndex = $DataGridView1.Rows.Add(@($fileName, $subPath))
     
-    # Dispatch polling for each web server to RunspacePool (non-blocking)
-    foreach ($webServer in $lstWeb.Items) {
-     try {
-      $colIndex = $DataGridView1.Columns[$webServer].Index
-      $fullUrl = "https://$webServer/$subPath/$fileName".Replace('\', '/')
-      
-      # Create PowerShell instance to run polling in background
-      $ps = [powershell]::Create()
-      $ps.RunspacePool = $script:RunspacePool
-      $null = $ps.AddScript($PollingScript)
-      $null = $ps.AddArgument($DataGridView1)  # GridControl
-      $null = $ps.AddArgument($rowIndex)
-      $null = $ps.AddArgument($webServer)
-      $null = $ps.AddArgument($colIndex)
-      $null = $ps.AddArgument($fullUrl)
-      $null = $ps.AddArgument($Form1)
-      $null = $ps.AddArgument($script:StopSignal)
-      
-      # Launch async (non-blocking) and store for cleanup
-      $handle = $ps.BeginInvoke()
-      $script:ActiveRunspaces += @{ PowerShell = $ps; Handle = $handle }
-     } catch {
-      # Silently ignore per-server dispatch errors
-     }
-    }
+    # Dispatch shared polling jobs for all web servers (non-blocking)
+    & $DispatchPollingJobsForFile $DataGridView1 $rowIndex $subPath $fileName $lstWeb.Items $Form1 $script:RunspacePool $script:StopSignal $script:ActiveRunspaces
    }.GetNewClosure() 
    $newWatcher.add_Created($action)
    $newWatcher.EnableRaisingEvents = $true
@@ -396,7 +418,7 @@ $btnStop_Click = {
  
  # Wait for active runspaces to complete and clean up
  if ($script:ActiveRunspaces.Count -gt 0) {
-  foreach ($job in $script:ActiveRunspaces) {
+ foreach ($job in $script:ActiveRunspaces) {
    try {
     if ($job.Handle -and -not $job.Handle.IsCompleted) {
      $job.Handle.AsyncWaitHandle.WaitOne(1000) | Out-Null  # Wait max 1 sec
@@ -407,7 +429,7 @@ $btnStop_Click = {
     # Silently ignore cleanup errors
    }
   }
-  $script:ActiveRunspaces = @()
+  $script:ActiveRunspaces = New-Object System.Collections.ArrayList
  }
  
  # Close and dispose the runspace pool
