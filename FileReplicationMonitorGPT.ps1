@@ -128,7 +128,6 @@ if (-not (Test-Path -LiteralPath $LogsDir)) {
 
 # Log retention: keep last 5 days (cleanup at startup)
 function Cleanup-OldLogs {
-    paramLogs {
     param([string]$Dir)
     try {
         $cutoff = (Get-Date).Date.AddDays(-5)
@@ -331,8 +330,8 @@ function Validate-StartPrereqs {
 
     foreach ($sf in $sync.Config.Subfolders) {
         $p = Get-AbsoluteSubfolderPath -RootUNC $root -Subfolder ([string]$sf)
-        if (-not (Test-Path -LiteralPath $p)) {
-            return "Subfolder not reachable: $p"
+        if (-not (Test-Path -LiteralPath $p -PathType Container)) {
+            return "Subfolder not reachable or not a directory: $p"
         }
     }
 
@@ -385,8 +384,17 @@ function Build-UrlForFile {
     }
 
     $rel = $FullPath.Substring($root.Length) # e.g. instit\...\foo.pdf
-    $relUrl = '/' + ($rel -replace '\\','/')
-    return ($base + $relUrl)
+    $relPath = $rel -replace '\\','/' # normalize backslashes
+    
+    # Use System.Uri to properly handle URL construction and avoid double slashes
+    try {
+        $baseUri = New-Object System.Uri($base + '/')
+        $mergedUri = New-Object System.Uri($baseUri, $relPath)
+        return $mergedUri.AbsoluteUri
+    } catch {
+        # Fallback to simple concatenation if Uri parsing fails
+        return ($base + '/' + $relPath)
+    }
 }
 
 function Stop-Monitoring {
@@ -424,15 +432,11 @@ function Stop-Monitoring {
     }
     $script:WatcherInfos = @()
 
-    # RunspacePool cleanup (do it off UI thread to avoid blocking)
+    # RunspacePool cleanup (synchronous to ensure completion before exit)
     if ($sync.Pool) {
-        $poolToDispose = $sync.Pool
+        try { $sync.Pool.Close() } catch { }
+        try { $sync.Pool.Dispose() } catch { }
         $sync.Pool = $null
-        [System.Threading.ThreadPool]::QueueUserWorkItem({
-            param($p)
-            try { $p.Close() } catch { }
-            try { $p.Dispose() } catch { }
-        }, $poolToDispose) | Out-Null
     }
 
     # Restore cert callback if we changed it
@@ -480,9 +484,10 @@ function Start-Monitoring {
 
     $sync.Cts = New-Object System.Threading.CancellationTokenSource
 
-    # RunspacePool max concurrency based on CPU count
+    # RunspacePool max concurrency: reasonable default of min(8, cpu_count)
+    # Polling is I/O-bound, not CPU-bound; avoid excessive thread creation
     $cpu = [Environment]::ProcessorCount
-    $max = [Math]::Max(4, $cpu * 4)
+    $max = [Math]::Min(8, [Math]::Max(2, $cpu))
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $max)
     $pool.ApartmentState = 'MTA'  # background work; UI stays STA
     $pool.ThreadOptions = 'ReuseThread'
@@ -511,9 +516,16 @@ function Start-Monitoring {
             try {
                 $fp = $Event.SourceEventArgs.FullPath
                 if ($sync.Monitoring -and $sync.Form -and -not $sync.Form.IsDisposed) {
-                    $null = $sync.Form.BeginInvoke($sync.HandleFileCreated, @($fp))
+                    try {
+                        $null = $sync.Form.BeginInvoke($sync.HandleFileCreated, @($fp))
+                    } catch {
+                        # Form disposed between check and invoke; ignore
+                    }
                 }
-            } catch { }
+            } catch {
+                # Log file operation errors
+                Write-LogLine -Level 'WARN' -Message "FileSystemWatcher event error: $($_.Exception.Message)"
+            }
         } | Out-Null
 
         # Error event
@@ -526,7 +538,11 @@ function Start-Monitoring {
             try { $exMsg = $Event.SourceEventArgs.GetException().Message } catch { $exMsg = 'Unknown watcher error' }
 
             if ($sync.Form -and -not $sync.Form.IsDisposed) {
-                $null = $sync.Form.BeginInvoke($sync.HandleWatcherError, @($sub, $p, $exMsg))
+                try {
+                    $null = $sync.Form.BeginInvoke($sync.HandleWatcherError, @($sub, $p, $exMsg))
+                } catch {
+                    # Form disposed between check and invoke; ignore
+                }
             }
         } | Out-Null
 
@@ -552,7 +568,14 @@ $sync.HandleFileCreated = [System.Action[string]]{
 
     if (-not $sync.Monitoring) { return }
 
-    $fileName = [System.IO.Path]::GetFileName($fullPath)
+    try {
+        $fileName = [System.IO.Path]::GetFileName($fullPath)
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-LogLine -Level 'WARN' -Message "Error extracting filename from: $fullPath - $errMsg"
+        return
+    }
+    
     if (-not $fileName) { return }
 
     # Filter by regex (case-insensitive)
@@ -561,18 +584,31 @@ $sync.HandleFileCreated = [System.Action[string]]{
     }
 
     # Add new row (even if same filename appears later)
-    $rowIndex = $sync.Grid.Rows.Add()
-    $sync.Grid.Rows[$rowIndex].Cells[0].Value = $fileName
-
-    # Tag includes full path + timestamp (internal distinction)
-    $sync.Grid.Rows[$rowIndex].Tag = [pscustomobject]@{
-        FullPath = $fullPath
-        SeenAt   = (Get-Date)
+    try {
+        $rowIndex = $sync.Grid.Rows.Add()
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-LogLine -Level 'ERROR' -Message "Failed to add grid row : $errMsg"
+        return
     }
+    
+    try {
+        $sync.Grid.Rows[$rowIndex].Cells[0].Value = $fileName
 
-    # Set initial statuses
-    for ($si=0; $si -lt $sync.Config.WebServers.Count; $si++) {
-        $sync.Grid.Rows[$rowIndex].Cells[$si + 1].Value = 'Scanning... (0s)'
+        # Tag includes full path + timestamp (internal distinction)
+        $sync.Grid.Rows[$rowIndex].Tag = [pscustomobject]@{
+            FullPath = $fullPath
+            SeenAt   = (Get-Date)
+        }
+
+        # Set initial statuses
+        for ($si=0; $si -lt $sync.Config.WebServers.Count; $si++) {
+            $sync.Grid.Rows[$rowIndex].Cells[$si + 1].Value = 'Scanning... (0s)'
+        }
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-LogLine -Level 'ERROR' -Message "Failed to update grid row $rowIndex : $errMsg"
+        return
     }
 
     Write-LogLine -Level 'INFO' -Message "File detected: $fullPath"
@@ -583,7 +619,6 @@ $sync.HandleFileCreated = [System.Action[string]]{
     $intervalMs = [int]$sync.Config.PollIntervalMs
     $timeoutSec = [int]$sync.Config.TimeoutSeconds
     $root = [string]$sync.Config.RootUNC
-    $certEnabled = [bool]$sync.Config.CertVerificationEnabled
 
     $pollScript = {
         param($sync, $rowIndex, $colIndex, $fileName, $url, $baseUrl, $token, $method, $intervalMs, $timeoutSec)
@@ -610,6 +645,7 @@ $sync.HandleFileCreated = [System.Action[string]]{
         $lastException = $null
 
         while (-not $token.IsCancellationRequested) {
+            $loopStart = [DateTime]::UtcNow
             $now = [DateTime]::UtcNow
             if ($now -ge $deadline) { break }
 
@@ -633,8 +669,8 @@ $sync.HandleFileCreated = [System.Action[string]]{
                     try { $req.AllowReadStreamBuffering = $false } catch { }
                 }
 
-                # Track active request for abort-on-cancel
-                $null = $sync.ActiveRequests.TryAdd($reqId, $req)
+                # Track active request for abort-on-cancel (must be done BEFORE GetResponse)
+                [void]$sync.ActiveRequests.TryAdd($reqId, $req)
 
                 try {
                     $resp = $req.GetResponse()
@@ -644,11 +680,13 @@ $sync.HandleFileCreated = [System.Action[string]]{
                     if ($method -eq 'GET') {
                         try {
                             $stream = $resp.GetResponseStream()
-                            if ($stream) { $stream.Close() }
+                            if ($stream) {
+                                try { $stream.Dispose() } catch { }
+                            }
                         } catch { }
                     }
 
-                    $resp.Close()
+                    try { $resp.Dispose() } catch { $resp.Close() }
 
                     if ($status -eq 200) {
                         $final = ("OK ({0}s)" -f $sec)
@@ -671,10 +709,12 @@ $sync.HandleFileCreated = [System.Action[string]]{
                             if ($method -eq 'GET') {
                                 try {
                                     $stream = $r.GetResponseStream()
-                                    if ($stream) { $stream.Close() }
+                                    if ($stream) {
+                                        try { $stream.Dispose() } catch { }
+                                    }
                                 } catch { }
                             }
-                            $r.Close()
+                            try { $r.Dispose() } catch { $r.Close() }
 
                             if ($status -eq 200) {
                                 $final = ("OK ({0}s)" -f $sec)
@@ -690,18 +730,26 @@ $sync.HandleFileCreated = [System.Action[string]]{
                         # (no UI spam; only final outcome will show ERROR if never got any response)
                     }
                 } finally {
-                    if ($resp) { try { $resp.Close() } catch { } }
-                    if ($req)  { try { $req.Abort() | Out-Null } catch { } }
-                    try { $null = $sync.ActiveRequests.TryRemove($reqId, [ref]$null) } catch { }
+                # Always cleanup resources
+                if ($resp) {
+                    try { $resp.Dispose() } catch { try { $resp.Close() } catch { } }
+                    $resp = $null
                 }
-            } catch {
-                $lastException = $_.Exception.Message
-            } finally {
-                try { $null = $sync.ActiveRequests.TryRemove($reqId, [ref]$null) } catch { }
+                if ($req) {
+                    try { $req.Abort() } catch { }
+                    $req = $null
+                }
+                [void]$sync.ActiveRequests.TryRemove($reqId, [ref]$null)
             }
+        } catch {
+            $lastException = $_.Exception.Message
 
             if ($token.IsCancellationRequested) { break }
-            Start-Sleep -Milliseconds $intervalMs
+            
+            # Sleep for the remaining interval (account for request time)
+            $loopElapsed = ([DateTime]::UtcNow - $loopStart).TotalMilliseconds
+            $sleepMs = [Math]::Max(0, $intervalMs - $loopElapsed)
+            if ($sleepMs -gt 0) { Start-Sleep -Milliseconds $sleepMs }
         }
 
         # Final outcome
