@@ -89,6 +89,70 @@ $btnRmvMon_Click = {
  }
 }
 
+# --- Async Polling Script Block (runs in RunspacePool) ---
+$PollingScript = {
+ param($GridControl, $RowIndex, $ServerName, $ColIndex, $Url, $Form1, $MonitoringActive)
+ 
+ $timeout = (Get-Date).AddMinutes(3)
+ $success = $false
+ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+ 
+ while ($MonitoringActive.IsRunning -and $stopwatch.Elapsed.TotalSeconds -lt 180) {
+  $elapsedSec = [math]::Floor($stopwatch.Elapsed.TotalSeconds)
+  
+  # Update UI: Scanning status with elapsed time
+  $Form1.Invoke([action]{
+   if ($RowIndex -lt $GridControl.Rows.Count) {
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Value = "Scanning... ($elapsedSec s)"
+   }
+  })
+  
+  $req = $null
+  $resp = $null
+  try {
+   $req = [System.Net.WebRequest]::Create($Url)
+   $req.Method = "HEAD"
+   $req.Timeout = 5000  # 5 second request timeout
+   $req.AllowAutoRedirect = $false
+   
+   $resp = $req.GetResponse()
+   $statusCode = [int]$resp.StatusCode
+   
+   if ($statusCode -eq 200) {
+    $success = $true
+    break
+   }
+  } catch {
+   # Silently continue on error; will retry or timeout
+  } finally {
+   if ($resp) {
+    try { $resp.Close() } catch {}
+    try { $resp.Dispose() } catch {}
+   }
+   if ($req) {
+    try { $req.Abort() } catch {}
+   }
+  }
+  
+  # Small 500ms sleep before retry
+  Start-Sleep -Milliseconds 500
+ }
+ 
+ # Final status update
+ $finalSec = [math]::Floor($stopwatch.Elapsed.TotalSeconds)
+ $Form1.Invoke([action]{
+  if ($RowIndex -lt $GridControl.Rows.Count) {
+   if ($success) {
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Value = "FOUND (200)"
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Style.BackColor = [System.Drawing.Color]::LightGreen
+   } else {
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Value = "TIMEOUT ($finalSec s)"
+    $GridControl.Rows[$RowIndex].Cells[$ColIndex].Style.BackColor = [System.Drawing.Color]::LightCoral
+   }
+  }
+ })
+}
+
 # --- History Scan Form Logic (UPDATED with Dynamic Columns, Colors, and SSL fix) ---
 
 $btnHistory_Click = {
@@ -193,7 +257,12 @@ $btnHistory_Click = {
     $histForm.ShowDialog()
 }
 
-# --- Main Start/Stop Monitoring Logic (UPDATED with Colors and SSL fix) ---
+# --- Main Start/Stop Monitoring Logic (UPDATED with Async Polling and Resource Cleanup) ---
+
+# Global state for monitoring and runspace management
+$script:MonitoringActive = @{ IsRunning = $false }
+$script:RunspacePool = $null
+$script:ActiveRunspaces = @()
 
 $btnStart_Click = {
  # SAVE CHANGES (captures the current Root path)
@@ -209,6 +278,13 @@ $btnStart_Click = {
  $btnStart.enabled = $false; $btnStart.BackColor = [System.Drawing.Color]::LightGray
  $btnStop.enabled = $true; $btnStop.BackColor = [System.Drawing.Color]::LightCoral
  $lblStatus.Text = "Status: MONITORING"; $lblStatus.ForeColor = [System.Drawing.Color]::Green
+ 
+ # --- 1.5. Initialize RunspacePool for async polling ---
+ $script:MonitoringActive.IsRunning = $true
+ $poolSize = [math]::Min(8, [System.Environment]::ProcessorCount)
+ $script:RunspacePool = [runspacefactory]::CreateRunspacePool(1, $poolSize)
+ $script:RunspacePool.Open()
+ $script:ActiveRunspaces = @()
  
  # --- 2. Dynamic Grid Setup (Reset Columns) ---
  $DataGridView1.Columns.Clear()
@@ -234,61 +310,43 @@ $btnStart_Click = {
    $newWatcher.IncludeSubdirectories = $false
    $newWatcher.SynchronizingObject = $Form1 #
    
-   # --- 4. The Action Logic with Retry Loop (UPDATED with colors) ---
+   # --- 4. The Action Logic (NOW ASYNC - Dispatches to RunspacePool) ---
    $action = {
     param($source, $e)
     # --- Check if item is a Directory ---
     $fullPhysicalPath = Join-Path -Path $watchPath -ChildPath $e.Name
     if ([System.IO.Directory]::Exists($fullPhysicalPath)) { return }
-    # A. Initialize Grid Row
+    # Check if file matches regex
     $fileName = $e.Name
     if (-not ($fileName -match $regexPattern)) { return }
-    $rowIndex = $DataGridView1.Rows.Add(@($fileName, $subPath)) 
-    # B. define the Timeout (3 Minutes from Now)
-    $timeout = (Get-Date).AddMinutes(3)
     
-    # C. Track which servers still need checking
-    $serversToCheck = New-Object System.Collections.Generic.List[string]
-    $lstWeb.Items | ForEach-Object { $serversToCheck.Add($_) }
+    # Add grid row for this file
+    $rowIndex = $DataGridView1.Rows.Add(@($fileName, $subPath))
     
-    # D. The Loop: Runs until Time is up OR All servers found
-    while ((Get-Date) -lt $timeout -and $serversToCheck.Count -gt 0) {
-     if ($btnStop.Enabled -eq $false) { break }
-     $currentBatch = @($serversToCheck)
-     foreach ($webServer in $currentBatch) {
+    # Dispatch polling for each web server to RunspacePool (non-blocking)
+    foreach ($webServer in $lstWeb.Items) {
+     try {
       $colIndex = $DataGridView1.Columns[$webServer].Index
-      $DataGridView1.Rows[$rowIndex].Cells[$colIndex].Value = "Scanning..."
-      $fullUrl = "https://$webServer/$subPath/$fileName".Replace('\\\', '/')
-      try {
-       $req = [System.Net.WebRequest]::Create($fullUrl)
-       $req.Method = "HEAD"
-       $resp = $req.GetResponse()
-       
-       # IF FOUND: Update Grid and Remove from "To Check" list, add color
-       $DataGridView1.Rows[$rowIndex].Cells[$colIndex].Value = "FOUND ($($resp.StatusCode))"
-       $DataGridView1.Rows[$rowIndex].Cells[$colIndex].Style.BackColor = [System.Drawing.Color]::LightGreen
-       $resp.Close()
-       $serversToCheck.Remove($webServer) | Out-Null
-      } 
-      catch {
-       # IF MISSING/Error: Update status, keep in list (will hit timeout eventually)
-       $DataGridView1.Rows[$rowIndex].Cells[$colIndex].Value = "SEARCHING..."
-      }
+      $fullUrl = "https://$webServer/$subPath/$fileName".Replace('\\', '/')
+      
+      # Create PowerShell instance to run polling in background
+      $ps = [powershell]::Create()
+      $ps.RunspacePool = $script:RunspacePool
+      $null = $ps.AddScript($PollingScript)
+      $null = $ps.AddArgument($DataGridView1)  # GridControl
+      $null = $ps.AddArgument($rowIndex)
+      $null = $ps.AddArgument($webServer)
+      $null = $ps.AddArgument($colIndex)
+      $null = $ps.AddArgument($fullUrl)
+      $null = $ps.AddArgument($Form1)
+      $null = $ps.AddArgument($script:MonitoringActive)
+      
+      # Launch async (non-blocking) and store for cleanup
+      $handle = $ps.BeginInvoke()
+      $script:ActiveRunspaces += @{ PowerShell = $ps; Handle = $handle }
+     } catch {
+      # Silently ignore per-server dispatch errors
      }
-     # E. The Non-Freezing Wait (5 Seconds)
-     if ($serversToCheck.Count -gt 0) {
-      for ($i = 0; $i -lt 50; $i++) { 
-       Start-Sleep -Milliseconds 100
-       [System.Windows.Forms.Application]::DoEvents()
-       if ($btnStop.Enabled -eq $false) { break }
-      }
-     }
-    }
-    # F. Final Cleanup: Mark remaining servers as TIMEOUT, add color
-    foreach ($webServer in $serversToCheck) {
-     $colIndex = $DataGridView1.Columns[$webServer].Index
-     $DataGridView1.Rows[$rowIndex].Cells[$colIndex].Value = "TIMEOUT"
-     $DataGridView1.Rows[$rowIndex].Cells[$colIndex].Style.BackColor = [System.Drawing.Color]::LightCoral
     }
    }.GetNewClosure() 
    $newWatcher.add_Created($action)
@@ -304,12 +362,39 @@ $btnStop_Click = {
  $btnStart.enabled = $true; $btnStart.BackColor = [System.Drawing.Color]::LightGreen
  $btnStop.enabled = $false; $btnStop.BackColor = [System.Drawing.Color]::LightGray
  $lblStatus.Text = "Status: STOPPED!"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
- # --- New Stop Logic ---
+ 
+ # --- Stop Monitoring & Clean Up Async Resources ---
+ $script:MonitoringActive.IsRunning = $false
+ 
+ # Disable all watchers and dispose them
  foreach ($watcher in $script:activeWatchers) {
   $watcher.EnableRaisingEvents = $false
   $watcher.Dispose()
  }
- $script:activeWatchers = @() # Clear the list
+ $script:activeWatchers = @()
+ 
+ # Wait for active runspaces to complete and clean up
+ if ($script:ActiveRunspaces.Count -gt 0) {
+  foreach ($job in $script:ActiveRunspaces) {
+   try {
+    if ($job.Handle -and -not $job.Handle.IsCompleted) {
+     $job.Handle.AsyncWaitHandle.WaitOne(1000) | Out-Null  # Wait max 1 sec
+    }
+    $job.PowerShell.EndInvoke($job.Handle) | Out-Null
+    $job.PowerShell.Dispose()
+   } catch {
+    # Silently ignore cleanup errors
+   }
+  }
+  $script:ActiveRunspaces = @()
+ }
+ 
+ # Close and dispose the runspace pool
+ if ($script:RunspacePool) {
+  $script:RunspacePool.Close()
+  $script:RunspacePool.Dispose()
+  $script:RunspacePool = $null
+ }
 }
 
 # --- Main Form Initialization ---
