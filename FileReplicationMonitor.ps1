@@ -24,32 +24,36 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$LogDir = Join-Path $ScriptDir "logs"
-$ConfigFile = Join-Path $ScriptDir "config.json"
+# Use $PSScriptRoot for reliable path resolution, fallback to $PWD if running unsaved
+$global:ScriptDir = $PSScriptRoot
+if ([string]::IsNullOrEmpty($global:ScriptDir)) { $global:ScriptDir = $PWD.Path }
 
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
+$global:LogDir = Join-Path $global:ScriptDir "logs"
+$global:ConfigFile = Join-Path $global:ScriptDir "config.json"
+
+if (-not (Test-Path $global:LogDir)) { New-Item -ItemType Directory -Path $global:LogDir | Out-Null }
 
 # Shared state for cancellation and active jobs tracking
-$SharedState = [hashtable]::Synchronized(@{
+$global:SharedState = [hashtable]::Synchronized(@{
     IsRunning = $false
 })
-$ActiveRunspaces = [System.Collections.Generic.List[psobject]]::new()
-$Watchers = [System.Collections.Generic.List[System.IO.FileSystemWatcher]]::new()
-$RunspacePool = $null
+$global:ActiveRunspaces = [System.Collections.Generic.List[psobject]]::new()
+$global:Watchers = [System.Collections.Generic.List[System.IO.FileSystemWatcher]]::new()
+$global:RunspacePool = $null
 
 # --- 3. Logging & Cleanup ---
 function Write-AppLog {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logLine = "[$timestamp] [$Level] $Message"
-    $logPath = Join-Path $LogDir "app-$(Get-Date -Format 'yyyyMMdd').log"
+    # Explicitly use $global:LogDir so scope is never lost
+    $logPath = Join-Path $global:LogDir "app-$(Get-Date -Format 'yyyyMMdd').log"
     Add-Content -Path $logPath -Value $logLine
 }
 
 function Cleanup-Logs {
     $cutoff = (Get-Date).AddDays(-5).Date
-    Get-ChildItem -Path $LogDir -Filter "app-*.log" | ForEach-Object {
+    Get-ChildItem -Path $global:LogDir -Filter "app-*.log" | ForEach-Object {
         if ($_.Name -match "app-(\d{4})(\d{2})(\d{2})\.log") {
             $logDate = [datetime]::new([int]$matches[1], [int]$matches[2], [int]$matches[3])
             if ($logDate -lt $cutoff) { Remove-Item $_.FullName -Force }
