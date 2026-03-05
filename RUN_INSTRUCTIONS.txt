@@ -1,0 +1,151 @@
+================================================================================
+FILE REPLICATION MONITOR - DEPLOYMENT & RUN INSTRUCTIONS
+================================================================================
+
+QUICK START
+-----------
+1. Place `Claude.ps1` on a shared network drive (e.g., \\ServerShare\folder\scripts\)
+2. Place the shared folder in everyone's PATH, or right-click the script and select "Run with PowerShell"
+3. The script auto-creates `config.json` with defaults on first run
+4. Review `config.json` and adjust RootUNC, Subfolders, WebServers as needed
+5. Restart the script; it will show a GUI and begin monitoring
+
+FILES
+-----
+Claude.ps1 
+  - Main application (production-ready)
+  - Auto-creates config.json if missing
+  - Auto-creates logs\ subfolder
+  - Auto-relaunches itself in STA mode if needed
+  - Hides console window
+
+config.json (auto-created on first run)
+  RootUNC: UNC path to the document root (defaults to \\ServerShare\folder\htdocs\)
+  Subfolders: Array of subfolders to monitor (3 by default)
+  FilenameRegex: Regex to filter filenames (case-insensitive)
+  WebServers: Array of HTTPS base URLs to poll (must be absolute URLs)
+  PollIntervalMs: Milliseconds between polling attempts (default: 900)
+  TimeoutSeconds: Global timeout per file (default: 180)
+  UseHeadVsGet: "HEAD" or "GET" method (default: "HEAD")
+  CertVerificationEnabled: true to verify HTTPS certs; false to allow self-signed/expired (default: false)
+
+logs/ (auto-created)
+  - Daily log files: app-YYYYMMDD.log
+  - Logs retention: 5 days (cleanup at startup)
+  - Entries: START, STOP, files detected, polling results, warnings
+
+GUI CONTROLS
+------------
+[Start]  - Begin monitoring (validates root + subfolders exist; shows error if not)
+[Stop]   - Stop monitoring (cancels all in-progress polling immediately)
+[Clear]  - Same as Stop + clear grid + clear error panel (start fresh)
+
+Status label (top-right):
+  RED     "STOPPED!"    - Not monitoring
+  GREEN   "MONITORING"  - Actively watching for files
+
+Grid:
+  Columns: Filename | Server1 URL | Server2 URL | ...
+  Status per cell:
+    "Scanning... (X s)"  - Still polling
+    "OK (X s)"           - Found on server (200 OK)
+    "TIMEOUT (X s)"      - Polling timed out
+    "ERROR (X s)"        - Exception occurred (never got success)
+
+Error Panel (bottom):
+  Displays warnings/errors only
+  Max 500 lines; oldest lines are removed when full
+  Cleared by the [Clear] button
+
+CONFIGURATION
+-------------
+Edit config.json before starting:
+
+{
+  "RootUNC": "\\\\ServerShare\\folder\\htdocs\\",
+  "Subfolders": [
+    "instit\\annceresult\\press\\preanre\\2026",
+    "instit\\annceresult\\press\\preanre",
+    "xml"
+  ],
+  "FilenameRegex": "^(PendingAuctions\\.pdf|...)*$",
+  "WebServers": [
+    "https://ihs-wb-p02.pktic.fiscalad.treasury.gov",
+    "https://another-server.example.com"
+  ],
+  "PollIntervalMs": 900,
+  "TimeoutSeconds": 180,
+  "UseHeadVsGet": "HEAD",
+  "CertVerificationEnabled": false
+}
+
+BEHAVIOR
+--------
+1. Startup: Validates paths, loads config, cleans old logs, initializes UI.
+2. On file detection (Created event):
+   - Regex filter applied (case-insensitive match)
+   - New grid row added (same filename = different row if detected again)
+   - Polling starts for ALL servers in parallel (capped by CPU-based RunspacePool)
+3. Polling loop per server:
+   - Attempts HTTP request (HEAD or GET) to the mapped URL
+   - Interval: 900 ms (default, configurable)
+   - Timeout: 180 seconds (global, configurable)
+   - Success: HTTP 200 status → "OK (X s)", stops polling for that server
+   - Redirects (301/302): ignored, polling continues
+   - Exception: logged, retried until timeout
+   - Timeout reached: "TIMEOUT (X s)" or "ERROR (X s)" depending on whether any HTTP response was received
+4. Stop behavior:
+   - Watchers disabled
+   - All polling cancelled immediately
+   - Grid preserved (not cleared unless Clear is clicked)
+5. Watcher failure:
+   - If a FileSystemWatcher fails/stops, app attempts automatic restart
+   - If restart fails, popup warning + log entry
+6. Logs:
+   - Daily file: logs\app-YYYYMMDD.log
+   - Retention: 5 days
+   - Cleanup: automatic on startup
+
+REQUIREMENTS
+------------
+- Windows PowerShell 5.1+
+- .NET Framework 4.5+ (Windows Forms, HttpWebRequest)
+- Network access to the root UNC path
+- HTTPS access to polling servers (certificate verification configurable)
+
+TROUBLESHOOTING
+---------------
+Script won't run:
+  - Right-click > "Run with PowerShell"
+  - Or: Open PowerShell ISE, set-executionpolicy -ExecutionPolicy ByPass -Scope Process, then ./Claude.ps1
+
+Config.json error:
+  - Check JSON syntax (must be valid JSON)
+  - Ensure RootUNC path uses double backslashes (\\ServerShare\...)
+  - WebServers must be absolute HTTPS URLs (https://..., not bare hostnames)
+
+Root UNC not reachable:
+  - Verify the path is correct and accessible from this machine
+  - Check network/VPN connection
+  - Ensure user has at least read permission on the folder
+
+Polling shows ERROR:
+  - Check if the WebServer URL is correct
+  - If HTTPS with self-signed cert, set CertVerificationEnabled: false
+  - Check server logs for 404 or other errors
+  - Verify the file actually exists on the server
+
+No files being detected:
+  - Check that files match the FilenameRegex pattern (case-insensitive)
+  - Verify they're in one of the monitored Subfolders
+  - Look at logs\app-YYYYMMDD.log for "File detected" messages
+
+PERFORMANCE
+-----------
+- RunspacePool scaled to min(8, CPU count) to balance concurrency
+- Each polling operation runs in a separate runspace (lightweight)
+- UI remains responsive (all updates marshalled to UI thread)
+- Supports dozens of files and servers without degradation
+- Memory: ~50-100 MB typical (varies by number of rows and log size)
+
+================================================================================
